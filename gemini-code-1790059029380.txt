@@ -1,0 +1,365 @@
+@'
+[CmdletBinding()]
+param()
+
+$ScriptDir = [System.AppDomain]::CurrentDomain.BaseDirectory
+if ([string]::IsNullOrWhiteSpace($ScriptDir)) { $ScriptDir = (Get-Location).Path }
+
+Clear-Host
+Write-Host "=== USB ADVANCED SECURITY AUDITOR & TRIAGE ===" -ForegroundColor Green
+Write-Host "[*] Gathering system components and digital artifacts..." -ForegroundColor Cyan
+
+$Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$ReportBase = "Audit_$($env:COMPUTERNAME)_$Timestamp"
+$JsonPath = [System.IO.Path]::Combine($ScriptDir, "$ReportBase.json")
+$HtmlPath = [System.IO.Path]::Combine($ScriptDir, "$ReportBase.html")
+
+# 1. System & Hardware Details
+$OS = (Get-CimInstance Win32_OperatingSystem).Caption
+$CPU = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+$RAM_GB = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)
+$User = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$BootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+$Uptime = (Get-Date) - $BootTime
+$UptimeStr = "$($Uptime.Days)d $($Uptime.Hours)h $($Uptime.Minutes)m"
+
+$DiskC = Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='C:'"
+$DiskFreeGB = [math]::Round($DiskC.FreeSpace / 1GB, 2)
+$DiskTotalGB = [math]::Round($DiskC.Size / 1GB, 2)
+
+# 2. Network Information
+$Gateway = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).NextHop
+$ActiveIdx = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Sort-Object RouteMetric | Select-Object -First 1).InterfaceIndex
+$PrimaryIP = "Disconnected"
+$PrimaryMAC = "N/A"
+if ($ActiveIdx) {
+    $PrimaryIP = (Get-NetIPAddress -InterfaceIndex $ActiveIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).IPAddress
+    $PrimaryMAC = (Get-NetAdapter -InterfaceIndex $ActiveIdx -ErrorAction SilentlyContinue).MacAddress
+}
+$DnsServers = ((Get-DnsClientServerAddress -InterfaceIndex $ActiveIdx -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses) -join ', '
+$WifiSSID = try { ((netsh wlan show interfaces) -match '^\s*SSID\s*:\s*(.+)$' -replace '^\s*SSID\s*:\s*', '').Trim() } catch { "None" }
+
+# 3. Security Baseline Engine
+$Score = 100
+$SecChecks = [ordered]@{}
+
+# Defender
+$Defender = try { Get-MpComputerStatus -ErrorAction Stop } catch { $null }
+$DefActive = $Defender.RealTimeProtectionEnabled -and $Defender.AntivirusEnabled
+$SecChecks["Defender Realtime Protection"] = if ($DefActive) { "ENABLED" } else { $Score -= 15; "DISABLED" }
+
+$SigAge = if ($Defender.AntivirusSignatureAge) { $Defender.AntivirusSignatureAge } else { 999 }
+if ($SigAge -le 7) {
+    $SecChecks["Defender Signatures"] = "UP-TO-DATE ($SigAge days old)"
+} else {
+    $Score -= 5
+    $SecChecks["Defender Signatures"] = "OUTDATED ($SigAge days old)"
+}
+
+# Firewall
+$FwCount = (Get-NetFirewallProfile -ErrorAction SilentlyContinue | Where-Object { -not $_.Enabled }).Count
+$SecChecks["Firewall (All Profiles)"] = if ($FwCount -eq 0) { "ENABLED" } else { $Score -= 10; "DISABLED" }
+
+# BitLocker
+$BitLocker = try { (Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop).ProtectionStatus } catch { "Off" }
+$SecChecks["BitLocker (C:)"] = if ($BitLocker -eq "On") { "ENCRYPTED" } else { $Score -= 10; "UNENCRYPTED" }
+
+# Secure Boot
+$SecureBoot = try { Confirm-SecureBootUEFI } catch { $false }
+$SecChecks["Secure Boot"] = if ($SecureBoot) { "ENABLED" } else { $Score -= 10; "DISABLED" }
+
+# Guest Account
+$GuestDisabled = try { (Get-CimInstance Win32_UserAccount -Filter "Name='Guest'").Disabled } catch { $true }
+$SecChecks["Guest Account"] = if ($GuestDisabled) { "DISABLED" } else { $Score -= 5; "ENABLED" }
+
+# SMBv1
+$Smb = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction SilentlyContinue).State
+$SecChecks["SMBv1 Protocol"] = if ($Smb -eq "Enabled") { $Score -= 15; "ENABLED" } else { "DISABLED" }
+
+# RDP
+$RdpVal = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+$SecChecks["Remote Desktop (RDP)"] = if ($RdpVal -eq 0) { $Score -= 5; "ENABLED" } else { "DISABLED" }
+
+# LLMNR Protocol
+$LLMNR = (Get-ItemProperty "HKLM:\Software\Policies\Microsoft\Windows NT\DNSClient" -Name "EnableMulticast" -ErrorAction SilentlyContinue).EnableMulticast
+$SecChecks["LLMNR Protocol"] = if ($LLMNR -eq 0) { "DISABLED" } else { $Score -= 5; "ENABLED (Poisoning Risk)" }
+
+# Remote Registry
+$RemoteReg = (Get-Service -Name "RemoteRegistry" -ErrorAction SilentlyContinue).Status
+$SecChecks["Remote Registry Service"] = if ($RemoteReg -eq "Running") { $Score -= 5; "RUNNING" } else { "STOPPED" }
+
+# PowerShell Execution Policy
+$Policy = Get-ExecutionPolicy
+$SecChecks["System Execution Policy"] = if ($Policy -in @("Unrestricted", "Bypass")) { $Score -= 5; "$Policy (Permissive)" } else { "$Policy" }
+
+# Sensitive Ports
+$OpenPorts = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object -Unique LocalPort
+$SensitivePorts = @(21, 22, 23, 445, 3389)
+$FoundRiskyPorts = $OpenPorts | Where-Object { $SensitivePorts -contains $_.LocalPort } | Select-Object -ExpandProperty LocalPort
+if ($FoundRiskyPorts) {
+    $Score -= 10
+    $SecChecks["Sensitive Listening Ports"] = "EXPOSED (" + ($FoundRiskyPorts -join ', ') + ")"
+} else {
+    $SecChecks["Sensitive Listening Ports"] = "CLEAN"
+}
+
+$FinalScore = [math]::Max(0, $Score)
+
+# 4. Artifact Gathering
+$StartupRaw = Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue | Where-Object { $_.Location -notmatch 'S-1-5-18|S-1-5-19|S-1-5-20' }
+$CleanStartup = @()
+foreach ($item in $StartupRaw) {
+    $loc = if ($item.Location -match 'HKU\\S-1-5-21') { "Current User (HKCU)" } 
+           elseif ($item.Location -match 'Common') { "All Users (HKLM)" }
+           elseif ($item.Location -match 'Startup') { "Startup Folder" }
+           else { "Registry AutoRun" }
+    $CleanStartup += [PSCustomObject]@{ Name=$item.Name; Command=$item.Command; Location=$loc }
+}
+$CleanStartup = $CleanStartup | Sort-Object Name -Unique
+$StartupRows = ($CleanStartup | ForEach-Object { "<tr><td><b>$($_.Name)</b></td><td style='font-family:Consolas;'>$($_.Command)</td><td><span class='badge' style='background:#334155;color:#e2e8f0;'>$($_.Location)</span></td></tr>" }) -join ""
+
+$UsbHistory = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Enum\USBSTOR\*" -ErrorAction SilentlyContinue | Select-Object FriendlyName, PSChildName
+$UsbHistRows = ($UsbHistory | ForEach-Object { "<tr><td>$($_.FriendlyName)</td><td>$($_.PSChildName)</td></tr>" }) -join ""
+
+$DnsCache = Get-DnsClientCache -ErrorAction SilentlyContinue | Select-Object -First 20 -Unique Entry, Data
+$DnsCacheRows = ($DnsCache | ForEach-Object { "<tr><td>$($_.Entry)</td><td>$($_.Data)</td></tr>" }) -join ""
+
+$HostsPath = "$env:windir\System32\drivers\etc\hosts"
+$HostsContent = Get-Content $HostsPath -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() -ne '' }
+$HostsRows = if ($HostsContent) {
+    ($HostsContent | ForEach-Object { "<tr><td style='color:#f87171;font-weight:bold;'>$_</td></tr>" }) -join ""
+} else {
+    "<tr><td>Standard Windows default hosts file (Clean)</td></tr>"
+}
+
+$SuspiciousTasks = Get-ScheduledTask -ErrorAction SilentlyContinue | Where-Object { 
+    $_.State -ne 'Disabled' -and 
+    $_.Actions.Execute -and 
+    $_.Actions.Execute -notmatch '^%windir%|^C:\\Windows' 
+} | Select-Object TaskName, @{N='Path';E={$_.Actions.Execute}}, State | Select-Object -First 10
+$TaskRows = ($SuspiciousTasks | ForEach-Object { "<tr><td><b>$($_.TaskName)</b></td><td style='font-family:Consolas;'>$($_.Path)</td><td>$($_.State)</td></tr>" }) -join ""
+
+$Admins = try { (Get-LocalGroupMember -Group "Administrators" -ErrorAction SilentlyContinue).Name } catch { "Access Denied" }
+$AdminRows = ($Admins | ForEach-Object { "<tr><td>$_</td></tr>" }) -join ""
+
+$UsbList = Get-PnpDevice -PresentOnly -Class 'USB' -ErrorAction SilentlyContinue | Select-Object FriendlyName, InstanceId
+$UsbRows = ($UsbList | ForEach-Object { "<tr><td>$($_.FriendlyName)</td><td>$($_.InstanceId)</td></tr>" }) -join ""
+
+$ListeningConns = Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress, LocalPort, OwningProcess | Select-Object -First 15
+$PortRows = ($ListeningConns | ForEach-Object { "<tr><td>$($_.LocalAddress):$($_.LocalPort)</td><td>$((Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName) (PID: $($_.OwningProcess))</td></tr>" }) -join ""
+
+$Hotfixes = Get-CimInstance Win32_QuickFixEngineering -ErrorAction SilentlyContinue | Sort-Object InstalledOn -Descending | Select-Object -First 5
+$HotfixRows = ($Hotfixes | ForEach-Object { "<tr><td>$($_.HotFixID)</td><td>$($_.Description)</td><td>$($_.InstalledOn)</td></tr>" }) -join ""
+
+# 5. CLI Output Summary
+Write-Host "Computer       : $env:COMPUTERNAME"
+Write-Host "Primary IP     : $PrimaryIP"
+Write-Host "MAC Address    : $PrimaryMAC"
+Write-Host "----------------------------------"
+foreach ($chk in $SecChecks.Keys) {
+    $val = $SecChecks[$chk]
+    $color = if ($val -match "ENABLED|CLEAN|ENCRYPTED|UP-TO-DATE|STOPPED" -and $chk -notmatch "SMBv1|Remote Desktop|Guest|LLMNR") { "Green" }
+             elseif ($chk -match "SMBv1|Remote Desktop|Guest|LLMNR" -and $val -match "DISABLED") { "Green" }
+             else { "Red" }
+    Write-Host "[*] $chk : $val" -ForegroundColor $color
+}
+Write-Host "----------------------------------"
+Write-Host "Security Score : $FinalScore/100" -ForegroundColor Cyan
+
+# 6. Export JSON
+$FullData = [ordered]@{
+    System      = @{ Computer=$env:COMPUTERNAME; User=$User; OS=$OS; CPU=$CPU; RAM_GB=$RAM_GB; Uptime=$UptimeStr; Storage="Free: $DiskFreeGB GB / Total: $DiskTotalGB GB" }
+    Network     = @{ PrimaryIP=$PrimaryIP; MAC=$PrimaryMAC; Gateway=$Gateway; DNS=$DnsServers; WifiSSID=$WifiSSID }
+    Audit       = @{ SecurityScore=$FinalScore; Checks=$SecChecks }
+    Admins      = $Admins
+    Startup     = $CleanStartup
+    USB_Present = $UsbList
+    USB_History = $UsbHistory
+    DNS_Cache   = $DnsCache
+    Hosts_File  = $HostsContent
+    Tasks       = $SuspiciousTasks
+}
+$FullData | ConvertTo-Json -Depth 4 | Out-File -FilePath $JsonPath -Encoding utf8
+
+# 7. Export HTML with Interactive Language & PDF Toggle
+$ScoreColor = if($FinalScore -ge 80){'#22c55e'}elseif($FinalScore -ge 50){'#eab308'}else{'#ef4444'}
+
+$SecCheckRows = ""
+foreach ($k in $SecChecks.Keys) {
+    $v = $SecChecks[$k]
+    $isPass = ($v -match "ENABLED|CLEAN|ENCRYPTED|UP-TO-DATE|STOPPED" -and $k -notmatch "SMBv1|Remote Desktop|Guest|LLMNR") -or ($k -match "SMBv1|Remote Desktop|Guest|LLMNR" -and $v -match "DISABLED")
+    $badge = if ($isPass) { "<span class='badge pass' data-en='PASS' data-ar='آمن'>PASS</span>" } else { "<span class='badge fail' data-en='ALERT' data-ar='تنبيه'>ALERT</span>" }
+    $SecCheckRows += "<tr><td>$k</td><td>$v</td><td>$badge</td></tr>"
+}
+
+$HtmlData = @"
+<!DOCTYPE html>
+<html lang="en" id="htmlDoc">
+<head>
+    <meta charset="utf-8">
+    <title>Security Audit - $env:COMPUTERNAME</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Cairo", sans-serif; background: #0b0f19; color: #f1f5f9; padding: 25px; margin: 0; }
+        .container { max-width: 1050px; margin: auto; }
+        .score-card { background: #131b2e; border: 1px solid #1e293b; border-radius: 12px; padding: 25px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; }
+        .score-circle { width: 95px; height: 95px; border-radius: 50%; border: 6px solid $ScoreColor; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; color: $ScoreColor; }
+        .controls { display: flex; gap: 12px; margin-bottom: 25px; }
+        .search-box { flex-grow: 1; padding: 12px 16px; background: #131b2e; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 14px; outline: none; }
+        .btn { border: 0; padding: 0 18px; border-radius: 8px; font-weight: bold; cursor: pointer; transition: 0.2s; font-family: inherit; font-size: 13.5px; height: 42px; display: flex; align-items: center; gap: 6px; }
+        .btn-print { background: #0284c7; color: #fff; }
+        .btn-print:hover { background: #0369a1; }
+        .btn-lang { background: #334155; color: #38bdf8; border: 1px solid #475569; }
+        .btn-lang:hover { background: #475569; }
+        .section-box { background: #131b2e; border: 1px solid #1e293b; border-radius: 10px; padding: 20px; margin-bottom: 22px; }
+        h2 { margin-top: 0; font-size: 16px; color: #38bdf8; display: flex; align-items: center; gap: 8px; border-bottom: 1px solid #1e293b; padding-bottom: 10px; text-transform: uppercase; }
+        table { width: 100%; border-collapse: collapse; font-size: 13.5px; margin-top: 5px; table-layout: fixed; }
+        th, td { padding: 9px 12px; border-bottom: 1px solid #1e293b; text-align: left; word-break: break-all; }
+        th { background: #0c1322; color: #94a3b8; font-size: 12px; text-transform: uppercase; }
+        .badge { padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+        .pass { background: #064e3b; color: #34d399; }
+        .fail { background: #7f1d1d; color: #f87171; }
+        .highlight { color: #38bdf8; font-weight: bold; }
+        [dir="rtl"] th, [dir="rtl"] td { text-align: right; }
+        @media print {
+            body { background: #fff; color: #000; padding: 0; }
+            .score-card, .section-box { background: #fff; border: 1px solid #ccc; color: #000; box-shadow: none; margin-bottom: 15px; }
+            h2 { color: #000; border-bottom: 1px solid #ccc; }
+            th { background: #eee; color: #000; }
+            td { border-bottom: 1px solid #eee; }
+            .controls { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="score-card">
+            <div>
+                <h1 id="titleHeader" style="margin:0; font-size: 24px; color:#fff;" data-en="USB Advanced Security Audit & Triage" data-ar="تقرير التدقيق الأمني الشامل للأجهزة">USB Advanced Security Audit & Triage</h1>
+                <p id="metaHeader" style="margin: 5px 0 0 0; color:#94a3b8; font-size: 13px;" data-en="Host: $env:COMPUTERNAME &bull; User: $User &bull; Generated: $Timestamp" data-ar="الجهاز: $env:COMPUTERNAME &bull; المستخدم: $User &bull; التاريخ: $Timestamp">Host: $env:COMPUTERNAME &bull; User: $User &bull; Generated: $Timestamp</p>
+            </div>
+            <div style="text-align:center;">
+                <div id="scoreLabel" style="font-size:12px;color:#94a3b8;margin-bottom:4px;" data-en="Security Score" data-ar="تقييم الأمان">Security Score</div>
+                <div class="score-circle">$FinalScore</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" id="filterInput" class="search-box" placeholder="🔍 Search any parameter, port, domain, or program across all tables..." data-en="🔍 Search any parameter, port, domain, or program across all tables..." data-ar="🔍 ابحث في أي قسم، منفذ، نطاق أو مسار عبر كافة الجداول...">
+            <button onclick="toggleLanguage()" class="btn btn-lang" id="langBtn">🌐 العربية</button>
+            <button onclick="window.print()" class="btn btn-print" id="printBtn" data-en="🖨️ Print / PDF" data-ar="🖨️ طباعة / حفظ PDF">🖨️ Print / PDF</button>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🛡️ 1. Security Posture Checks" data-ar="🛡️ 1. فحوصات الوضع الأمني الأساسي">🛡️ 1. Security Posture Checks</h2>
+            <table><thead><tr><th data-en="Check Parameter" data-ar="عنصر الفحص">Check Parameter</th><th data-en="Status" data-ar="الحالة">Status</th><th data-en="Result" data-ar="النتيجة">Result</th></tr></thead><tbody>$SecCheckRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🌐 2. Network Configuration" data-ar="🌐 2. إعدادات الشبكة والاتصال">🌐 2. Network Configuration</h2>
+            <table>
+                <tr><th data-en="Property" data-ar="الخاصية">Property</th><th data-en="Value" data-ar="القيمة">Value</th></tr>
+                <tr><td data-en="Primary Active IP" data-ar="الـ IP الأساسي النشط">Primary Active IP</td><td class="highlight">$PrimaryIP</td></tr>
+                <tr><td data-en="MAC Address" data-ar="عنوان الـ MAC">MAC Address</td><td>$PrimaryMAC</td></tr>
+                <tr><td data-en="Default Gateway" data-ar="البوابة الافتراضية">Default Gateway</td><td>$Gateway</td></tr>
+                <tr><td data-en="DNS Servers" data-ar="خوادم الـ DNS">DNS Servers</td><td>$DnsServers</td></tr>
+                <tr><td data-en="Wi-Fi SSID" data-ar="اسم شبكة الـ Wi-Fi">Wi-Fi SSID</td><td>$WifiSSID</td></tr>
+            </table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="💻 3. System & Hardware Details" data-ar="💻 3. مواصفات النظام والعتاد">💻 3. System & Hardware Details</h2>
+            <table>
+                <tr><th data-en="Component" data-ar="المكون">Component</th><th data-en="Details" data-ar="التفاصيل">Details</th></tr>
+                <tr><td data-en="Operating System" data-ar="نظام التشغيل">Operating System</td><td>$OS</td></tr>
+                <tr><td data-en="System Uptime" data-ar="وقت تشغيل الجهاز">System Uptime</td><td>$UptimeStr</td></tr>
+                <tr><td data-en="Processor" data-ar="المعالج">Processor</td><td>$CPU</td></tr>
+                <tr><td data-en="Total Memory" data-ar="الذاكرة العشوائية">Total Memory</td><td>$RAM_GB GB</td></tr>
+                <tr><td data-en="Disk Storage (C:)" data-ar="المساحة التخزينية (C:)">Disk Storage (C:)</td><td>$DiskFreeGB GB free of $DiskTotalGB GB</td></tr>
+            </table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="📜 4. USB Device Connection History (Forensics)" data-ar="📜 4. سجل توصيل أجهزة الـ USB السابقة (تحليل جنائي)">📜 4. USB Device Connection History (Forensics)</h2>
+            <table><thead><tr><th data-en="Device Model" data-ar="موديل الجهاز">Device Model</th><th data-en="Serial / Hardware ID" data-ar="المعرف التسلسلي">Serial / Hardware ID</th></tr></thead><tbody>$UsbHistRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🌐 5. Active DNS Cache Entries" data-ar="🌐 5. كاش الـ DNS النشط (المواقع المتصل بها مؤخراً)">🌐 5. Active DNS Cache Entries</h2>
+            <table><thead><tr><th data-en="Query Name (Domain)" data-ar="اسم النطاق (Domain)">Query Name (Domain)</th><th data-en="Resolved IP / Data" data-ar="الـ IP والبيانات">Resolved IP / Data</th></tr></thead><tbody>$DnsCacheRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="📝 6. Hosts File Custom Entries" data-ar="📝 6. السجلات المخصصة في ملف Hosts">📝 6. Hosts File Custom Entries</h2>
+            <table><thead><tr><th data-en="Host Entry Line" data-ar="سطر السجل">Host Entry Line</th></tr></thead><tbody>$HostsRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="⏰ 7. Suspicious Scheduled Tasks (Non-System Paths)" data-ar="⏰ 7. المهام المجدولة غير النظامية">⏰ 7. Suspicious Scheduled Tasks (Non-System Paths)</h2>
+            <table><thead><tr><th data-en="Task Name" data-ar="اسم المهمة">Task Name</th><th data-en="Binary / Script Path" data-ar="مسار الملف / السكربت">Binary / Script Path</th><th data-en="State" data-ar="الحالة">State</th></tr></thead><tbody>$TaskRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🚀 8. Clean Startup Programs" data-ar="🚀 8. برامج بدء التشغيل التلقائي">🚀 8. Clean Startup Programs</h2>
+            <table><thead><tr><th style="width:25%;" data-en="Application" data-ar="التطبيق">Application</th><th style="width:55%;" data-en="Command Line" data-ar="سطر الأوامر">Command Line</th><th style="width:20%;" data-en="Location" data-ar="الموقع">Location</th></tr></thead><tbody>$StartupRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="👥 9. Local Administrators" data-ar="👥 9. أعضاء مجموعة المسؤولين (Administrators)">👥 9. Local Administrators</h2>
+            <table><thead><tr><th data-en="Account Name" data-ar="اسم الحساب">Account Name</th></tr></thead><tbody>$AdminRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🚪 10. Active Listening Ports" data-ar="🚪 10. منافذ الاستماع المفتوحة (Listening Ports)">🚪 10. Active Listening Ports</h2>
+            <table><thead><tr><th data-en="Local Address" data-ar="العنوان المحلي">Local Address</th><th data-en="Service / Process" data-ar="الخدمة / العملية">Service / Process</th></tr></thead><tbody>$PortRows</tbody></table>
+        </div>
+
+        <div class="section-box">
+            <h2 data-en="🔄 11. Recent Windows Hotfixes" data-ar="🔄 11. آخر التحديثات والترقيعات الأمنية (Hotfixes)">🔄 11. Recent Windows Hotfixes</h2>
+            <table><thead><tr><th data-en="Hotfix ID" data-ar="معرف التحديث">Hotfix ID</th><th data-en="Description" data-ar="الوصف">Description</th><th data-en="Installed Date" data-ar="تاريخ التثبيت">Installed Date</th></tr></thead><tbody>$HotfixRows</tbody></table>
+        </div>
+    </div>
+
+    <script>
+        let currentLang = 'en';
+
+        function toggleLanguage() {
+            currentLang = currentLang === 'en' ? 'ar' : 'en';
+            let isAr = currentLang === 'ar';
+
+            document.getElementById('htmlDoc').setAttribute('dir', isAr ? 'rtl' : 'ltr');
+            document.getElementById('htmlDoc').setAttribute('lang', isAr ? 'ar' : 'en');
+            document.getElementById('langBtn').textContent = isAr ? '🌐 English' : '🌐 العربية';
+
+            document.querySelectorAll('[data-en]').forEach(el => {
+                let val = el.getAttribute('data-' + currentLang);
+                if (val) {
+                    if (el.tagName === 'INPUT') {
+                        el.placeholder = val;
+                    } else {
+                        el.innerHTML = val;
+                    }
+                }
+            });
+        }
+
+        document.getElementById('filterInput').addEventListener('keyup', function() {
+            let filter = this.value.toLowerCase();
+            let rows = document.querySelectorAll('tbody tr');
+            rows.forEach(function(row) {
+                let text = row.textContent.toLowerCase();
+                row.style.display = text.includes(filter) ? '' : 'none';
+            });
+        });
+    </script>
+</body>
+</html>
+"@
+$HtmlData | Out-File -FilePath $HtmlPath -Encoding utf8
+
+Write-Host ""
+Write-Host "[+] All Reports Saved Successfully:" -ForegroundColor Green
+Write-Host "    $JsonPath"
+Write-Host "    $HtmlPath"
+Write-Host ""
+Read-Host "Press Enter to exit"
+'@ | Out-File -FilePath "C:\Users\mkop7\Desktop\audit.ps1" -Encoding utf8
